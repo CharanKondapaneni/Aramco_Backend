@@ -1,0 +1,453 @@
+{
+  "ontology": {
+    "name": "Aramco HSE Site Intelligence",
+    "version": "1.0.0",
+    "description": "Ontology for the Aramco HSE site management database. Describes all entities, their attributes, relationships, business concepts and common query patterns. This ontology is passed to the LLM before every SQL generation request.",
+    "database": "tracklynk_demo",
+    "site_context": "Industrial oil and gas facility undergoing a turnaround (planned maintenance shutdown). Site has ~2,400 workers, ~450 active permits, multiple hazard zones with hot-work, confined-space and other high-risk activities."
+  },
+
+  "entities": {
+
+    "zone": {
+      "table": "zone",
+      "description": "A physical area or unit within the facility. Zones have hazard classifications and contain workers, permits and assets.",
+      "real_world_meaning": "Physical locations like Unit 2 Hydrocracker, Unit 3 Coker, Tank Farm North, Admin area",
+      "columns": {
+        "id": { "type": "TEXT", "description": "Unique zone identifier e.g. Z1, Z2, Z3", "example": "Z2" },
+        "name": { "type": "TEXT", "description": "Full zone name", "example": "Unit 2 — Hydrocracker" },
+        "short_name": { "type": "TEXT", "description": "Abbreviated label", "example": "Hydrocracker" },
+        "hazard_level": {
+          "type": "TEXT",
+          "description": "Risk classification of the zone",
+          "values": ["high", "medium", "low"],
+          "note": "High hazard zones require valid permits for all work"
+        },
+        "zone_type": { "type": "TEXT", "description": "Operational classification", "example": "process_unit" },
+        "occupancy_capacity": { "type": "INTEGER", "description": "Maximum permitted occupancy" },
+        "geo_polygon": { "type": "JSONB", "description": "GeoJSON polygon of zone boundary for map rendering" }
+      }
+    },
+
+    "permit": {
+      "table": "permit",
+      "description": "A work permit authorizing specific activities in a specific zone for a specific time window. Permits expire at valid_to. After expiry, workers must stop and vacate the zone.",
+      "real_world_meaning": "Official safety authorization document. Without a valid permit, work in a hazard zone is illegal and dangerous.",
+      "columns": {
+        "id": { "type": "TEXT", "description": "Permit number", "example": "HW-4471, CS-1182, GP-9033" },
+        "permit_type": {
+          "type": "TEXT",
+          "description": "Type of work being permitted",
+          "values": ["hot-work", "confined-space", "general", "work-at-height"],
+          "note": "hot-work = welding/cutting/grinding near flammable materials. confined-space = entry into enclosed spaces with limited access"
+        },
+        "status": {
+          "type": "TEXT",
+          "description": "Current permit status",
+          "values": ["valid", "expired", "breached", "pending_verification"],
+          "note": "expired = past valid_to time. breached = conditions violated. Workers must stop work when permit expires or is breached."
+        },
+        "zone_id": { "type": "TEXT FK->zone.id", "description": "Zone where work is authorized" },
+        "valid_from": { "type": "TIMESTAMPTZ", "description": "When permit becomes active" },
+        "valid_to": { "type": "TIMESTAMPTZ", "description": "When permit expires. After this time status should be expired." },
+        "risk_bucket": {
+          "type": "TEXT",
+          "description": "HSE risk category",
+          "values": ["safety", "health", "equipment", "compliance"]
+        },
+        "issuer": { "type": "TEXT", "description": "Person or role who issued the permit" },
+        "flagged_job_id": { "type": "TEXT FK->flagged_job.id", "description": "If this permit is linked to a flagged job violation, this references it" },
+        "extension_requested": { "type": "BOOLEAN", "description": "Whether an extension was formally requested" }
+      }
+    },
+
+    "flagged_job": {
+      "table": "flagged_job",
+      "description": "A job or work activity that has been flagged as a violation — typically because workers are still on location inside a hazard zone with an expired, breached or missing permit. Flagged jobs are the core safety alerts on the site.",
+      "real_world_meaning": "A detected safety violation where work is happening without proper authorization. Each flagged job is ranked by severity.",
+      "columns": {
+        "id": { "type": "TEXT", "description": "Flagged job identifier", "example": "FJ-001, FJ-002, FJ-003" },
+        "rank": { "type": "INTEGER", "description": "Priority rank — 1 is most critical" },
+        "permit_id": { "type": "TEXT FK->permit.id", "description": "The permit that is expired or breached" },
+        "permit_type": { "type": "TEXT", "description": "Type of permit involved" },
+        "zone_id": { "type": "TEXT FK->zone.id", "description": "Zone where violation is occurring" },
+        "location_description": { "type": "TEXT", "description": "Sub-location description within the zone", "example": "Hydrocracker platform, level 3" },
+        "severity": {
+          "type": "TEXT",
+          "description": "How serious the violation is",
+          "values": ["critical", "warning", "info"]
+        },
+        "risk_bucket": {
+          "type": "TEXT",
+          "description": "HSE risk category",
+          "values": ["safety", "health", "equipment", "compliance"]
+        },
+        "workers_on_site": { "type": "INTEGER", "description": "Number of workers still physically present in the hazard zone for this job. This is the count of people who need to be contacted to stop work." },
+        "reason": { "type": "TEXT", "description": "Narrative explanation of why this was flagged" },
+        "detected_at": { "type": "TIMESTAMPTZ", "description": "When the violation was first detected" },
+        "evidence": { "type": "JSONB", "description": "Structured evidence block including permit record, location trail, timestamps" }
+      }
+    },
+
+    "worker": {
+      "table": "worker",
+      "description": "A person on site — either Aramco staff or contractor. Workers have a current zone based on their last location signal. Workers are linked to zones not directly to permits.",
+      "real_world_meaning": "Every tagged person on site with a location tracking device.",
+      "columns": {
+        "id": { "type": "TEXT", "description": "Worker identifier" },
+        "tag_number": { "type": "INTEGER", "description": "Physical RFID/GPS tag number" },
+        "zone_id": { "type": "TEXT FK->zone.id", "description": "Current zone from last location fix" },
+        "role": { "type": "TEXT", "description": "Employment type", "values": ["staff", "contractor"] },
+        "location_source": { "type": "TEXT", "description": "How location was determined", "values": ["gate", "location"] },
+        "last_coordinates": { "type": "JSONB", "description": "GeoJSON point {lat, lng} of last known position" },
+        "last_seen": { "type": "TIMESTAMPTZ", "description": "Timestamp of last location signal" }
+      },
+      "note": "To find workers on expired permits, join via zone: worker.zone_id = permit.zone_id WHERE permit.status = 'expired'. OR use flagged_job.workers_on_site which is the pre-computed count."
+    },
+
+    "permit_condition": {
+      "table": "permit_condition",
+      "description": "Individual safety conditions that must be met for a permit to remain valid. Each permit has multiple conditions.",
+      "columns": {
+        "id": { "type": "TEXT", "description": "Condition identifier" },
+        "permit_id": { "type": "TEXT FK->permit.id" },
+        "label": { "type": "TEXT", "description": "Condition name", "example": "Continuous gas monitoring" },
+        "state": {
+          "type": "TEXT",
+          "description": "Current compliance state",
+          "values": ["compliant", "attention", "breached"]
+        },
+        "detail": { "type": "TEXT", "description": "Narrative detail about the condition state" },
+        "sources": { "type": "JSONB", "description": "Data sources that determined this condition state" }
+      }
+    },
+
+    "gas_test_reading": {
+      "table": "gas_test_reading",
+      "description": "Gas test readings for confined-space permits. Tests must be repeated at regular intervals.",
+      "columns": {
+        "permit_id": { "type": "TEXT FK->permit.id" },
+        "reading_time": { "type": "TIMESTAMPTZ", "description": "When test was taken" },
+        "result": { "type": "TEXT", "description": "Test outcome", "example": "Within limits, Oxygen 20.9%, LEL 0%" },
+        "interval_minutes": { "type": "INTEGER", "description": "Required interval between tests, typically 15 minutes" }
+      }
+    },
+
+    "permit_entrant": {
+      "table": "permit_entrant",
+      "description": "People who have entered a confined space under a specific permit.",
+      "columns": {
+        "id": { "type": "TEXT" },
+        "permit_id": { "type": "TEXT FK->permit.id" },
+        "label": { "type": "TEXT", "description": "Person name or identifier" },
+        "company": { "type": "TEXT", "description": "Employer company" },
+        "entered_at": { "type": "TIMESTAMPTZ", "description": "When they entered the confined space" },
+        "is_inside": { "type": "BOOLEAN", "description": "Whether they are currently inside" }
+      }
+    },
+
+    "permit_entry_exit_log": {
+      "table": "permit_entry_exit_log",
+      "description": "Chronological log of all entry and exit events for a permit.",
+      "columns": {
+        "permit_id": { "type": "TEXT FK->permit.id" },
+        "event_time": { "type": "TIMESTAMPTZ" },
+        "actor": { "type": "TEXT", "description": "Who performed the action" },
+        "event_description": { "type": "TEXT", "description": "What happened" },
+        "note": { "type": "TEXT", "description": "Optional supplementary note" }
+      }
+    },
+
+    "muster_event": {
+      "table": "muster_event",
+      "description": "A muster drill or emergency muster event. Tracks real-time progress of accounting for all personnel on site.",
+      "real_world_meaning": "Emergency roll call — everyone on site must report to their designated muster point.",
+      "columns": {
+        "id": { "type": "UUID" },
+        "as_of": { "type": "TIMESTAMPTZ", "description": "Snapshot timestamp" },
+        "alarm_started_at": { "type": "TIMESTAMPTZ", "description": "When muster alarm was triggered" },
+        "state": {
+          "type": "TEXT",
+          "description": "Current muster state",
+          "values": ["drill", "emergency", "complete", "standby"]
+        },
+        "state_label": { "type": "TEXT", "description": "Human readable state label" },
+        "elapsed_seconds": { "type": "INTEGER", "description": "Seconds since alarm started" },
+        "total_accounted": { "type": "INTEGER", "description": "Personnel confirmed at muster points" },
+        "total_expected": { "type": "INTEGER", "description": "Total personnel expected on site" },
+        "projection_full_accounting_minutes": { "type": "INTEGER", "description": "Projected minutes until full accounting" },
+        "projection_basis": { "type": "TEXT", "description": "How projection was calculated" },
+        "projection_confidence": { "type": "INTEGER", "description": "Confidence % in projection" },
+        "measured_completion_label": { "type": "TEXT", "description": "Formatted elapsed time when last drill completed e.g. 2:47" }
+      }
+    },
+
+    "muster_point": {
+      "table": "muster_point",
+      "description": "A designated assembly point where workers gather during a muster. Each point covers specific zones.",
+      "columns": {
+        "id": { "type": "TEXT" },
+        "name": { "type": "TEXT", "description": "Muster point name", "example": "Muster Point A — North" },
+        "covers_zones": { "type": "JSONB", "description": "Array of zone names this muster point serves" },
+        "capacity": { "type": "INTEGER", "description": "Maximum people this point can accommodate" },
+        "accounted_count": { "type": "INTEGER", "description": "Personnel confirmed at this point so far" },
+        "expected_count": { "type": "INTEGER", "description": "Personnel expected at this point" },
+        "radius_m": { "type": "NUMERIC", "description": "Assembly radius in metres" },
+        "geo_point": { "type": "JSONB", "description": "GeoJSON point location of muster point" }
+      }
+    },
+
+    "signal": {
+      "table": "signal",
+      "description": "An automatically detected anomaly or condition requiring attention. Signals are generated by the signal detection engine by monitoring raw data tables. They are pre-computed safety alerts.",
+      "real_world_meaning": "AI-detected site anomalies — expired permits with live occupancy, gas tests overdue, asset alarms with permits nearby etc.",
+      "columns": {
+        "id": { "type": "TEXT" },
+        "signal_type": {
+          "type": "TEXT",
+          "description": "Category of signal",
+          "values": ["expired_permit_live_occupancy", "gas_test_overdue", "asset_alarm_permit_overlap", "high_risk_permit_concentration", "worker_fatigue", "zone_breach", "calibration_due", "confined_space_entrant_overdue", "near_miss"]
+        },
+        "title": { "type": "TEXT", "description": "Short signal title" },
+        "description": { "type": "TEXT", "description": "Full narrative description" },
+        "severity": {
+          "type": "TEXT",
+          "values": ["critical", "warning", "info"]
+        },
+        "impact": {
+          "type": "TEXT",
+          "values": ["high", "medium", "low"]
+        },
+        "risk_bucket": {
+          "type": "TEXT",
+          "values": ["safety", "health", "equipment", "compliance"]
+        },
+        "confidence_score": { "type": "INTEGER", "description": "Model confidence 0-100" },
+        "recommended_action": { "type": "TEXT", "description": "What action to take" },
+        "detected_at": { "type": "TIMESTAMPTZ", "description": "When signal was generated" },
+        "trend": {
+          "type": "TEXT",
+          "values": ["worsening", "stable", "improving"]
+        }
+      }
+    },
+
+    "action": {
+      "table": "action",
+      "description": "A prioritized action item for the persona to complete. Actions are ranked by risk priority.",
+      "columns": {
+        "id": { "type": "TEXT" },
+        "rank": { "type": "INTEGER", "description": "Priority order — 1 is highest priority" },
+        "title": { "type": "TEXT", "description": "Short action description" },
+        "risk_bucket": {
+          "type": "TEXT",
+          "values": ["safety", "health", "equipment", "compliance"]
+        },
+        "priority": {
+          "type": "TEXT",
+          "values": ["highest", "high", "medium", "low"]
+        },
+        "rationale": { "type": "TEXT", "description": "Why this action is needed" },
+        "owner": { "type": "TEXT", "description": "Who is responsible" },
+        "owner_note": { "type": "TEXT", "description": "Additional ownership context" },
+        "due_by": { "type": "TEXT", "description": "When action must be completed" },
+        "evidence": { "type": "JSONB", "description": "Array of evidence strings" },
+        "sources": { "type": "JSONB", "description": "Array of data source names" },
+        "draft_task": { "type": "TEXT", "description": "Pre-written task instruction" },
+        "target_system": { "type": "TEXT", "description": "System where action will be logged" },
+        "status": {
+          "type": "TEXT",
+          "values": ["pending_confirmation", "confirmed", "done"]
+        }
+      }
+    },
+
+    "asset": {
+      "table": "asset",
+      "description": "Equipment or machinery on site with health monitoring. Assets can have alarms that affect nearby permit safety.",
+      "columns": {
+        "id": { "type": "TEXT" },
+        "tag": { "type": "TEXT", "description": "Engineering tag number", "example": "C-2101" },
+        "name": { "type": "TEXT", "description": "Human readable asset name", "example": "Unit 2 Hydrocracker Compressor" },
+        "zone_id": { "type": "TEXT FK->zone.id" },
+        "asset_type": { "type": "TEXT", "description": "Equipment classification" },
+        "criticality": {
+          "type": "TEXT",
+          "values": ["high", "medium", "low"]
+        },
+        "health_score": { "type": "INTEGER", "description": "Condition score 0-100. Below 70 = degraded." },
+        "health_band": {
+          "type": "TEXT",
+          "values": ["healthy", "watch", "degraded", "critical"]
+        },
+        "alarm_state": {
+          "type": "TEXT",
+          "values": ["normal", "attention", "alarm"]
+        },
+        "alarm_label": { "type": "TEXT", "description": "Current alarm description" },
+        "trend": {
+          "type": "TEXT",
+          "values": ["worsening", "stable", "improving"]
+        },
+        "rul_value": { "type": "NUMERIC", "description": "Remaining useful life quantity" },
+        "rul_unit": { "type": "TEXT", "description": "Unit for RUL", "values": ["days", "months"] },
+        "rul_confidence": { "type": "INTEGER", "description": "Confidence % in RUL prediction" },
+        "hse_implication": { "type": "TEXT", "description": "Safety narrative about asset condition" }
+      }
+    },
+
+    "asset_reading": {
+      "table": "asset_reading",
+      "description": "Sensor readings for an asset — vibration, temperature, pressure etc.",
+      "columns": {
+        "reading_type_id": { "type": "TEXT", "description": "Type of reading" },
+        "asset_id": { "type": "TEXT FK->asset.id" },
+        "label": { "type": "TEXT", "description": "Human readable reading name", "example": "Bearing vibration" },
+        "current_value": { "type": "TEXT", "description": "Latest reading value" },
+        "unit": { "type": "TEXT", "description": "Engineering unit", "example": "mm/s" },
+        "state": {
+          "type": "TEXT",
+          "values": ["complaint", "attention", "alarm"]
+        },
+        "threshold_description": { "type": "TEXT", "description": "What the threshold is" },
+        "series": { "type": "JSONB", "description": "Array of recent historical values for trend display" },
+        "source_system": { "type": "TEXT", "description": "Which monitoring system produced this reading" }
+      }
+    },
+
+    "reconciliation_run": {
+      "table": "reconciliation_run",
+      "description": "A headcount reconciliation event — comparing worker counts across multiple source systems to get one trusted figure.",
+      "columns": {
+        "id": { "type": "UUID" },
+        "as_of": { "type": "TIMESTAMPTZ", "description": "When reconciliation was performed" },
+        "resolved_count": { "type": "INTEGER", "description": "Final reconciled headcount" },
+        "method": { "type": "TEXT", "description": "Reconciliation methodology used" },
+        "audit_logged": { "type": "BOOLEAN", "description": "Written to immutable audit record" }
+      }
+    },
+
+    "reconciliation_source": {
+      "table": "reconciliation_source",
+      "description": "Individual source system contribution to a reconciliation run.",
+      "columns": {
+        "id": { "type": "UUID" },
+        "reconciliation_id": { "type": "UUID FK->reconciliation_run.id" },
+        "source_name": { "type": "TEXT", "description": "Name of the data source", "example": "Gate access-control, Permit-to-work system, Contractor timesheets" },
+        "record_count": { "type": "INTEGER", "description": "Headcount from this source" },
+        "delta": { "type": "INTEGER", "description": "Difference from reconciled figure. Non-zero means this source disagrees." },
+        "reliability": { "type": "TEXT", "description": "Qualitative reliability rating of this source" },
+        "note": { "type": "TEXT", "description": "Source behaviour explanation" }
+      }
+    },
+
+    "data_source": {
+      "table": "data_source",
+      "description": "Connected external data systems that feed the TrackLynk platform.",
+      "columns": {
+        "id": { "type": "TEXT" },
+        "name": { "type": "TEXT", "description": "System name", "example": "Permit-to-work system, Gate access-control" },
+        "status": {
+          "type": "TEXT",
+          "values": ["connected", "partial"]
+        },
+        "description": { "type": "TEXT" },
+        "last_sync_at": { "type": "TIMESTAMPTZ" },
+        "record_count": { "type": "INTEGER" },
+        "is_vendor_agnostic": { "type": "BOOLEAN", "description": "Works with any vendor" }
+      }
+    }
+  },
+
+  "relationships": {
+    "permit_to_zone": "permit.zone_id → zone.id — A permit authorizes work in one zone",
+    "flagged_job_to_permit": "flagged_job.permit_id → permit.id — A flagged job references the permit that is expired or breached",
+    "flagged_job_to_zone": "flagged_job.zone_id → zone.id — The zone where the violation is occurring",
+    "worker_to_zone": "worker.zone_id → zone.id — Worker's current location zone",
+    "asset_to_zone": "asset.zone_id → zone.id — Zone where asset is located",
+    "permit_condition_to_permit": "permit_condition.permit_id → permit.id — Conditions belonging to a permit",
+    "gas_test_to_permit": "gas_test_reading.permit_id → permit.id — Gas test readings for a confined-space permit",
+    "entrant_to_permit": "permit_entrant.permit_id → permit.id — People who entered under a permit",
+    "log_to_permit": "permit_entry_exit_log.permit_id → permit.id — Entry/exit events for a permit",
+    "recon_source_to_run": "reconciliation_source.reconciliation_id → reconciliation_run.id"
+  },
+
+  "business_concepts": {
+    "expired_permit_with_live_occupancy": {
+      "description": "The most critical HSE violation — workers still on location after permit expiry",
+      "query_pattern": "SELECT fj.*, p.valid_to, p.permit_type, z.name as zone_name FROM flagged_job fj JOIN permit p ON p.id = fj.permit_id JOIN zone z ON z.id = fj.zone_id WHERE p.status = 'expired' AND fj.workers_on_site > 0 ORDER BY fj.rank",
+      "key_fields": "flagged_job.workers_on_site = people still on location, permit.valid_to = when it expired"
+    },
+    "people_on_expired_permits": {
+      "description": "How many workers are still inside hazard zones with expired permits",
+      "query_pattern": "SELECT SUM(fj.workers_on_site) as total_workers, COUNT(fj.id) as flagged_jobs FROM flagged_job fj JOIN permit p ON p.id = fj.permit_id WHERE p.status = 'expired'",
+      "key_fields": "SUM(flagged_job.workers_on_site) gives total people count"
+    },
+    "locations_of_expired_permits": {
+      "description": "Where expired permit violations are happening",
+      "query_pattern": "SELECT p.id, p.permit_type, z.name as zone_name, fj.location_description, fj.workers_on_site FROM permit p JOIN zone z ON z.id = p.zone_id JOIN flagged_job fj ON fj.permit_id = p.id WHERE p.status = 'expired' AND p.permit_type = 'hot-work'",
+      "key_fields": "zone.name = zone location, flagged_job.location_description = sub-location"
+    },
+    "high_risk_permits": {
+      "description": "Permits in the safety or health risk buckets",
+      "query_pattern": "SELECT * FROM permit WHERE status = 'valid' AND risk_bucket IN ('safety', 'health')"
+    },
+    "muster_unaccounted": {
+      "description": "Personnel not yet confirmed at muster points",
+      "query_pattern": "SELECT mp.name, mp.expected_count - mp.accounted_count as unaccounted FROM muster_point mp WHERE mp.accounted_count < mp.expected_count"
+    },
+    "asset_alarm_near_permits": {
+      "description": "Assets in alarm state with active permits in the same zone",
+      "query_pattern": "SELECT a.tag, a.name, a.alarm_state, COUNT(p.id) as permits_in_zone FROM asset a JOIN permit p ON p.zone_id = a.zone_id WHERE a.alarm_state = 'alarm' AND p.status = 'valid' GROUP BY a.id, a.tag, a.name, a.alarm_state"
+    },
+    "headcount_discrepancy": {
+      "description": "Why headcounts from different systems disagree",
+      "query_pattern": "SELECT rs.source_name, rs.record_count, rs.delta, rs.reliability FROM reconciliation_source rs JOIN reconciliation_run rr ON rr.id = rs.reconciliation_id ORDER BY rr.as_of DESC"
+    }
+  },
+
+  "common_questions": {
+    "show_flagged_jobs": {
+      "question_patterns": ["show flagged jobs", "jobs without permits", "expired permits with workers", "hazard zone violations"],
+      "component": "FlaggedJobsTable",
+      "is_known_component": true,
+      "query_fn": "get_flagged_jobs"
+    },
+    "permit_detail": {
+      "question_patterns": ["walk me through the permit", "confined space entry", "show permit", "CS-"],
+      "component": "PermitDetailCard",
+      "is_known_component": true,
+      "query_fn": "get_permits"
+    },
+    "muster_status": {
+      "question_patterns": ["muster status", "who is unaccounted", "muster drill", "how long did muster take"],
+      "component": "MusterBoard",
+      "is_known_component": true,
+      "query_fn": "get_muster"
+    },
+    "actions": {
+      "question_patterns": ["what should I act on", "prioritized actions", "before the night shift", "what to do"],
+      "component": "PrioritizedActionCards",
+      "is_known_component": true,
+      "query_fn": "get_actions"
+    },
+    "asset_health": {
+      "question_patterns": ["asset health", "compressor", "equipment condition", "C-2101", "machinery"],
+      "component": "AssetHealthCard",
+      "is_known_component": true,
+      "query_fn": "get_assets"
+    },
+    "headcount": {
+      "question_patterns": ["can I trust these numbers", "headcount disagree", "reconciliation", "how many people"],
+      "component": "HeadcountReconciliationPanel",
+      "is_known_component": true,
+      "query_fn": "get_reconciliation"
+    },
+    "site_map": {
+      "question_patterns": ["show on map", "site map", "where are", "location on map"],
+      "component": "SiteMapPanel",
+      "is_known_component": true,
+      "query_fn": "get_site_geo"
+    }
+  }
+}
