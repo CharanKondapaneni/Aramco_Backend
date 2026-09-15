@@ -36,7 +36,7 @@ async def get_site_operational(
 
     return build_response(
         ctx=ctx,
-        visualization_type="Table",
+        visualization_type="FlaggedJobsTable",
         visualization_data=viz_data,
         raw_data={"zones": raw.get("zones", [])},
         data_sources_used=["Permit-to-work system", "Location and tag data (vendor-agnostic)"],
@@ -56,7 +56,7 @@ async def get_site_geo(
 
     return build_response(
         ctx=ctx,
-        visualization_type="Map",
+        visualization_type="SiteMapPanel",
         visualization_data=raw,
         map_variant="site",
         data_sources_used=["Location and tag data (vendor-agnostic)"],
@@ -85,9 +85,27 @@ async def get_worker_positions(
 
     return build_response(
         ctx=ctx,
-        visualization_type="Map",
+        visualization_type="SiteMapPanel",
         visualization_data=geo,
         map_variant="site",
         data_sources_used=["Location and tag data (vendor-agnostic)", "Gate access-control"],
         freshness="live",
+    )
+
+@router.get("/actions", response_model=TrackLynkResponse, summary="Prioritized Actions")
+async def get_actions(
+    ctx:  PersonaContext = Depends(get_persona_context),
+    pool: asyncpg.Pool   = Depends(get_pool),
+):
+    """Returns prioritized actions for the current persona."""
+    from app.db import queries
+    from app.utils.transformers import transform
+    raw      = await queries.get_actions(pool, ctx)
+    viz_data = transform("PrioritizedActionCards", raw)
+    return build_response(
+        ctx=ctx,
+        visualization_type="PrioritizedActionCards",
+        visualization_data=viz_data,
+        data_sources_used=["Permit-to-work system", "HSE action tracker"],
+        freshness="under 1 minute ago",
     )

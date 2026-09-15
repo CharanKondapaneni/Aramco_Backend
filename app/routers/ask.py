@@ -15,6 +15,7 @@ Track 2b — Cache miss + unknown/dynamic component:
 """
 
 import asyncio
+import json
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException
 
@@ -41,14 +42,27 @@ COMPONENT_QUERY_MAP = {
     "SiteMapPanel":                 "get_site_geo",
 }
 
-COMPONENT_VIZ_TYPE = {
-    "FlaggedJobsTable":             "Table",
-    "PermitDetailCard":             "DetailPanel",
-    "MusterBoard":                  "StatusBoard",
-    "PrioritizedActionCards":       "ActionCards",
-    "AssetHealthCard":              "Cards",
-    "HeadcountReconciliationPanel": "ReconciliationPanel",
-    "SiteMapPanel":                 "Map",
+# Maps component name to ordered list of {type, variant} dicts
+# Order matches manifest inlineComponents order
+# variant matches the prop passed to the React component
+COMPONENT_VIZ_TYPES = {
+    "FlaggedJobsTable":             [{"type": "SiteMapPanel",  "variant": "flagged"}, {"type": "FlaggedJobsTable", "variant": None}],
+    "PermitDetailCard":             [{"type": "IndoorViewer",  "variant": None},      {"type": "PermitDetailCard", "variant": None}],
+    "MusterBoard":                  [{"type": "MusterBoard",   "variant": None},      {"type": "MusterLocationMap","variant": None}],
+    "PrioritizedActionCards":       [{"type": "PrioritizedActionCards", "variant": None}],
+    "AssetHealthCard":              [{"type": "AssetHealthCard",        "variant": None}],
+    "HeadcountReconciliationPanel": [{"type": "HeadcountReconciliationPanel", "variant": None}],
+    "SiteMapPanel":                 [{"type": "SiteMapPanel",  "variant": "site"}],
+}
+
+# Maps viz_type to which query function provides its data
+# When a component needs multiple visualizations, each viz type
+# may need data from a different query function
+VIZ_TYPE_QUERY = {
+    "SiteMapPanel":                 "get_site_geo",
+    "IndoorViewer":                 "get_indoor_geo",
+    "MusterLocationMap":            "get_muster",
+    # All others use the primary component query function
 }
 
 GREETING_QUESTION = "__greeting__"
@@ -70,34 +84,17 @@ async def ask_init(
     Fetches signals + KPIs in parallel, LLM generates greeting.
     Greeting cached in query_cache as first conversation turn.
     """
+    # Fetch signals and KPIs from DB in parallel
     signals, kpis = await asyncio.gather(
         queries.get_signals(pool, ctx),
         queries.get_kpis(pool, ctx),
     )
 
-    ai_message, suggested_chips = await llm_service.generate_greeting(
-        signals=signals,
-        kpis=kpis,
-        persona=ctx.persona_id,
-        client_id=ctx.client_id,
-    )
-
-    # Cache greeting as first conversation turn
-    greeting_hash = cache.make_question_hash(GREETING_QUESTION, ctx)
-    await cache.write_cached_query(
-        pool=pool,
-        question_hash=greeting_hash,
-        question=GREETING_QUESTION,
-        ctx=ctx,
-        component=None,
-        sql_query=None,
-        viz_type=None,
-        is_known_component=False,
-        query_fn=None,
-        suggested_chips=suggested_chips,
-        capability="Proactive Intelligence",
-        ai_message=ai_message,
-    )
+    # Read greeting from cache — no LLM call on init
+    greeting_hash   = cache.make_question_hash(GREETING_QUESTION, ctx)
+    cached_greeting = await cache.get_cached_query(pool, greeting_hash)
+    ai_message      = cached_greeting.get("ai_message") if cached_greeting else None
+    suggested_chips = (cached_greeting.get("suggested_chips") or []) if cached_greeting else []
 
     return build_response(
         ctx=ctx,
@@ -154,37 +151,73 @@ async def ask(
         capability         = cached["capability"]
 
         # Always fetch LIVE data — never cache the data itself
-        # Explicitly cast is_known_component to bool in case asyncpg returns
-        # it as a different type
         is_known = bool(is_known_component) if is_known_component is not None else False
         has_fn   = bool(query_fn_name) if query_fn_name else False
 
         if is_known and has_fn:
             query_fn = getattr(queries, query_fn_name, None)
             raw_data = await query_fn(pool, ctx) if query_fn else {}
-            viz_data = transform(viz_type, raw_data) if viz_type else None
+            # Build multiple visualizations — each spec has type + variant
+            viz_specs = json.loads(viz_type) if viz_type and viz_type.startswith("[") else ([{"type": viz_type, "variant": None}] if viz_type else [])
+            viz_list  = []
+            for spec in viz_specs:
+                # spec can be a dict {"type":..,"variant":..} or a plain string
+                if isinstance(spec, dict):
+                    vt      = spec["type"]
+                    variant = spec.get("variant")
+                else:
+                    vt      = spec
+                    variant = None
+                secondary_fn_name = VIZ_TYPE_QUERY.get(vt)
+                if secondary_fn_name and secondary_fn_name != query_fn_name:
+                    secondary_fn = getattr(queries, secondary_fn_name, None)
+                    vt_data = await secondary_fn(pool, ctx) if secondary_fn else {}
+                else:
+                    vt_data = raw_data
+                viz_list.append({"type": vt, "variant": variant, "data": transform(vt, vt_data, variant=variant)})
+            viz_data = viz_list if viz_list else None
         elif sql_query and is_safe_sql(sql_query):
+            # Run SQL for AI context only
             rows     = await execute_sql(pool, sql_query)
             raw_data = rows
-            viz_data = build_generic_table(rows) if viz_type == "Table" else {"rows": rows}
+
+            # For visualization, always use the pre-built query function
+            # to ensure complete data shape — fall back to component query map
+            viz_specs = json.loads(viz_type) if viz_type and viz_type.startswith("[") else ([{"type": viz_type, "variant": None}] if viz_type else [])
+            viz_data  = []
+            for spec in viz_specs:
+                vt      = spec["type"] if isinstance(spec, dict) else spec
+                variant = spec.get("variant") if isinstance(spec, dict) else None
+                # Look up the right query function for this viz type
+                fn_name = VIZ_TYPE_QUERY.get(vt) or COMPONENT_QUERY_MAP.get(component)
+                if fn_name:
+                    fn      = getattr(queries, fn_name, None)
+                    vt_data = await fn(pool, ctx) if fn else {}
+                elif vt == "SiteMapPanel":
+                    geo_fn  = getattr(queries, "get_site_geo", None)
+                    vt_data = await geo_fn(pool, ctx) if geo_fn else {}
+                else:
+                    vt_data = {}
+                viz_data.append({"type": vt, "variant": variant, "data": transform(vt, vt_data, variant=variant)})
+            viz_data = viz_data if viz_data else None
         else:
             raw_data = {}
             viz_data = None
 
-        # LLM generates fresh ai_message from live data + conversation history
-        # Chips served from cache — no LLM call needed for chips
-        ai_message, _ = await llm_service.generate_answer(
-            question=question,
-            data=raw_data,
-            component=component,
-            persona=ctx.persona_id,
-            conversation_history=history,
-        )
+        # Use cached ai_message if available — only call LLM if not pre-seeded
+        ai_message = cached.get("ai_message")
+        if not ai_message:
+            ai_message, _ = await llm_service.generate_answer(
+                question=question,
+                data=raw_data,
+                component=component,
+                persona=ctx.persona_id,
+                conversation_history=history,
+            )
 
         return build_response(
             ctx=ctx,
-            visualization_type=viz_type,
-            visualization_data=viz_data,
+            visualization_list=viz_data if isinstance(viz_data, list) else None,
             ai_message=ai_message,
             suggested_chips=cached_chips,
             capability=capability,
@@ -211,10 +244,26 @@ async def ask(
     if is_known_component and component in COMPONENT_QUERY_MAP:
 
         query_fn_name = COMPONENT_QUERY_MAP[component]
-        viz_type      = COMPONENT_VIZ_TYPE.get(component, "Table")
+        viz_specs     = COMPONENT_VIZ_TYPES.get(component, [{"type": component, "variant": None}])
+        viz_type_str  = json.dumps(viz_specs)
         query_fn      = getattr(queries, query_fn_name, None)
         raw_data      = await query_fn(pool, ctx) if query_fn else {}
-        viz_data      = transform(viz_type, raw_data)
+        viz_list = []
+        for spec in viz_specs:
+            if isinstance(spec, dict):
+                vt      = spec["type"]
+                variant = spec.get("variant")
+            else:
+                vt      = spec
+                variant = None
+            secondary_fn_name = VIZ_TYPE_QUERY.get(vt)
+            if secondary_fn_name and secondary_fn_name != query_fn_name:
+                secondary_fn = getattr(queries, secondary_fn_name, None)
+                vt_data = await secondary_fn(pool, ctx) if secondary_fn else {}
+            else:
+                vt_data = raw_data
+            viz_list.append({"type": vt, "variant": variant, "data": transform(vt, vt_data, variant=variant)})
+        viz_data = viz_list
 
         ai_message, suggested_chips = await llm_service.generate_answer(
             question=question,
@@ -224,15 +273,15 @@ async def ask(
             conversation_history=history,
         )
 
-        # Cache metadata — no SQL, no data
+        # Cache metadata — store viz_types as JSON array string
         await cache.write_cached_query(
             pool=pool,
             question_hash=question_hash,
             question=question,
             ctx=ctx,
             component=component,
-            sql_query=None,          # no SQL for known components
-            viz_type=viz_type,
+            sql_query=None,
+            viz_type=viz_type_str,
             is_known_component=True,
             query_fn=query_fn_name,
             suggested_chips=suggested_chips,
@@ -242,8 +291,7 @@ async def ask(
 
         return build_response(
             ctx=ctx,
-            visualization_type=viz_type,
-            visualization_data=viz_data,
+            visualization_list=viz_data,
             ai_message=ai_message,
             suggested_chips=suggested_chips,
             capability="Anomaly Detection",

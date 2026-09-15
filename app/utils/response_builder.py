@@ -12,6 +12,7 @@ def build_response(
     ctx:                PersonaContext,
     visualization_type: str | None = None,
     visualization_data: dict | None = None,
+    visualization_list: list[dict] | None = None,
     map_variant:        str | None = None,
     raw_data:           dict | None = None,
     report_data:        dict | None = None,
@@ -26,29 +27,30 @@ def build_response(
 ) -> TrackLynkResponse:
     """
     Builds the standard response envelope.
-    Called by every router endpoint — never construct TrackLynkResponse directly.
+    Called by every router endpoint.
 
     Args:
-        ctx:                  Persona context from headers
-        visualization_type:   Primary component type e.g. "Table", "StatusBoard"
-        visualization_data:   Data for the primary component
-        map_variant:          Map variant if a Map is included e.g. "flagged"
-        raw_data:             Raw data payload (page-load endpoints)
-        report_data:          Report payload
-        ai_message:           LLM generated message (POST /ask only)
-        suggested_chips:      Next question suggestions (POST /ask only)
-        capability:           AI capability label
-        confidence:           Confidence score 0-100
-        data_sources_used:    List of data source names
-        as_of:                Timestamp of the data
-        freshness:            Human-readable freshness label
-        extra_visualizations: Additional visualization items beyond the primary
+        visualization_list:   Pre-built list of {"type": ..., "data": ...} dicts.
+                              Use this when returning multiple visualizations.
+                              Takes priority over visualization_type/data.
+        visualization_type:   Single component type (used when only one viz).
+        visualization_data:   Data for the single component.
+        extra_visualizations: Additional visualization items beyond the primary.
     """
 
-    # Build visualization list
     visualizations = []
 
-    if visualization_type and visualization_data is not None:
+    # Pre-built list takes priority
+    if visualization_list:
+        for v in visualization_list:
+            visualizations.append(
+                VisualizationItem(
+                    type=v["type"],
+                    variant=v.get("variant"),
+                    data=v.get("data"),
+                )
+            )
+    elif visualization_type and visualization_data is not None:
         visualizations.append(
             VisualizationItem(
                 type=visualization_type,
@@ -57,7 +59,7 @@ def build_response(
             )
         )
 
-    # Append any additional visualizations (e.g. Map + Table together)
+    # Append any additional visualizations
     if extra_visualizations:
         for v in extra_visualizations:
             visualizations.append(

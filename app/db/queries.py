@@ -38,6 +38,54 @@ def _iso(val) -> str | None:
     return str(val)
 
 
+def _condition_freshness(state: str, latest_gas: dict) -> str:
+    """
+    Returns per-condition freshness.
+    Gas monitoring conditions use the last gas test time.
+    Other conditions use the permit validation time.
+    """
+    from datetime import datetime, timezone
+    if not latest_gas:
+        return "unknown"
+    reading_time = latest_gas.get("reading_time")
+    if reading_time is None:
+        return "unknown"
+    if isinstance(reading_time, str):
+        try:
+            reading_time = datetime.fromisoformat(reading_time)
+        except Exception:
+            return "unknown"
+    now = datetime.now(timezone.utc)
+    if reading_time.tzinfo is None:
+        reading_time = reading_time.replace(tzinfo=timezone.utc)
+    diff = int((now - reading_time).total_seconds() / 60)
+    if diff < 1:
+        return "under 1 minute ago"
+    if diff < 60:
+        return f"{diff} minutes ago"
+    hours = diff // 60
+    return f"{hours} hour{'s' if hours > 1 else ''} ago"
+
+
+def _parse_json_field(value) -> list:
+    """
+    Safely parses a DB field that may be a Python list (asyncpg JSONB)
+    or a JSON-encoded string. Always returns a list.
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            import json as _json
+            parsed = _json.loads(value)
+            return parsed if isinstance(parsed, list) else [parsed]
+        except Exception:
+            return [value]
+    return []
+
+
 def _records_to_dicts(records: list[asyncpg.Record]) -> list[dict]:
     return [dict(r) for r in records]
 
@@ -108,7 +156,7 @@ async def get_signals(pool: asyncpg.Pool, ctx: PersonaContext) -> list:
                 "severity":           r["severity"],
                 "risk_bucket":        r["risk_bucket"],
                 "recommended_action": r["recommended_action"],
-                "sources":            r["sources"] or [],
+                "sources":            _parse_json_field(r["sources"]),
                 "detected_at":        _iso(r["detected_at"]),
                 "trend":              r["trend"],
                 "confidence":         r["confidence_score"],
@@ -419,16 +467,26 @@ async def get_site_geo(pool: asyncpg.Pool, ctx: PersonaContext) -> dict:
         features = []
 
         zone_rows = await conn.fetch(
-            "SELECT id, name, hazard_level, geo_polygon FROM zone WHERE geo_polygon IS NOT NULL"
+            "SELECT id, name, short_name, hazard_level, geo_polygon FROM zone WHERE geo_polygon IS NOT NULL"
         )
         for r in zone_rows:
+            # Count people and permits per zone for map labels
+            people = await conn.fetchval(
+                "SELECT COUNT(*) FROM worker WHERE zone_id = $1", r["id"]
+            ) or 0
+            permits = await conn.fetchval(
+                "SELECT COUNT(*) FROM permit WHERE zone_id = $1 AND status = 'valid'", r["id"]
+            ) or 0
             features.append({
                 "type": "Feature",
                 "properties": {
-                    "kind":   "zone",
-                    "id":     r["id"],
-                    "name":   r["name"],
-                    "hazard": r["hazard_level"],
+                    "kind":    "zone",
+                    "id":      r["id"],
+                    "name":    r["name"],
+                    "short":   r["short_name"] or r["name"],
+                    "hazard":  r["hazard_level"],
+                    "people":  people,
+                    "permits": permits,
                 },
                 "geometry": _parse_jsonb(r["geo_polygon"]),
             })
@@ -553,11 +611,12 @@ async def get_permits(pool: asyncpg.Pool, ctx: PersonaContext, scope: str = "all
             "zone_name": permit["zone_name"] or "",
             "conditions": [
                 {
-                    "id":      r["id"],
-                    "label":   r["label"],
-                    "state":   r["state"],
-                    "detail":  r["detail"],
-                    "sources": r["sources"] or [],
+                    "id":        r["id"],
+                    "label":     r["label"],
+                    "state":     r["state"],
+                    "detail":    r["detail"],
+                    "sources":   _parse_json_field(r["sources"]),
+                    "freshness": _condition_freshness(r["state"], latest_gas),
                 }
                 for r in conditions
             ],
@@ -611,33 +670,38 @@ async def get_permits(pool: asyncpg.Pool, ctx: PersonaContext, scope: str = "all
 # ── Indoor Geo ────────────────────────────────────────────────────────────────
 
 async def get_indoor_geo(pool: asyncpg.Pool, ctx: PersonaContext) -> dict:
+    """
+    Returns indoor GeoJSON from the static floor plan file,
+    overlaying live condition states from the DB.
+    """
+    import json as _json
+    import os as _os
+
+    # Load static floor plan
+    data_path = _os.path.join(_os.path.dirname(__file__), '..', 'data', 'aramco', 'hse-gm', 'indoor.geo.json')
+    with open(data_path) as f:
+        geo = _json.load(f)
+
     async with pool.acquire() as conn:
+        # Overlay live condition states on fixture features
         permit_id = await conn.fetchval("""
             SELECT id FROM permit
-            WHERE permit_type = 'confined-space'
+            WHERE permit_type = 'confined-space' AND status = 'valid'
             ORDER BY valid_from DESC LIMIT 1
         """)
-
-        features = []
         if permit_id:
-            rows = await conn.fetch("""
-                SELECT id, label, state FROM permit_condition WHERE permit_id = $1
-            """, permit_id)
-            for r in rows:
-                features.append({
-                    "type": "Feature",
-                    "properties": {
-                        "kind":  "fixture",
-                        "name":  r["label"],
-                        "state": r["state"],
-                    },
-                    "geometry": None,
-                })
+            conditions = await conn.fetch(
+                "SELECT label, state FROM permit_condition WHERE permit_id = $1", permit_id
+            )
+            state_map = {r["label"]: r["state"] for r in conditions}
+            for f in geo.get("features", []):
+                if f["properties"].get("kind") == "fixture":
+                    name = f["properties"].get("name", "")
+                    if name in state_map:
+                        f["properties"]["state"] = state_map[name]
 
-        return {"type": "FeatureCollection", "features": features}
+    return geo
 
-
-# ── Reconciliation ────────────────────────────────────────────────────────────
 
 async def get_reconciliation(pool: asyncpg.Pool, ctx: PersonaContext, scope: str = "all") -> dict:
     async with pool.acquire() as conn:
@@ -734,7 +798,7 @@ async def get_muster(pool: asyncpg.Pool, ctx: PersonaContext) -> dict:
             zones.append({
                 "id":              r["id"],
                 "name":            r["name"],
-                "covers_zones":    r["covers_zones"] or [],
+                "covers_zones":    _parse_json_field(r["covers_zones"]),
                 "capacity":        r["capacity"],
                 "accounted_count": r["accounted_count"],
                 "expected_count":  r["expected_count"],
@@ -810,7 +874,7 @@ async def get_actions(pool: asyncpg.Pool, ctx: PersonaContext) -> dict:
                 "owner_note":    r["owner_note"],
                 "due_by":        r["due_by"],
                 "evidence":      r["evidence"] or [],
-                "sources":       r["sources"] or [],
+                "sources":       _parse_json_field(r["sources"]),
                 "draft_task":    r["draft_task"],
                 "target_system": r["target_system"],
                 "status":        r["status"],
@@ -915,18 +979,22 @@ async def get_data_sources(pool: asyncpg.Pool, ctx: PersonaContext) -> list:
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT id, name, status, description,
-                   last_sync_at, record_count, is_vendor_agnostic
+                   last_sync_at, record_count, is_vendor_agnostic,
+                   icon, category, error_detail
             FROM data_source ORDER BY name
         """)
         return [
             {
-                "id":                r["id"],
-                "name":              r["name"],
-                "status":            r["status"],
-                "description":       r["description"],
-                "last_sync_at":      _iso(r["last_sync_at"]),
-                "record_count":      r["record_count"],
+                "id":                 r["id"],
+                "name":               r["name"],
+                "status":             r["status"],
+                "description":        r["description"],
+                "last_sync_at":       _iso(r["last_sync_at"]),
+                "record_count":       r["record_count"],
                 "is_vendor_agnostic": r["is_vendor_agnostic"],
+                "icon":               r["icon"],
+                "category":           r["category"],
+                "error_detail":       r["error_detail"],
             }
             for r in rows
         ]
